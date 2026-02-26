@@ -72,6 +72,8 @@ BULLET_SPEED    = 600
 EBULLET_SPEED   = 260
 ENEMY_SPAWN_CD  = 1.8   # seconds between spawns (decreases with score)
 POWERUP_CHANCE  = 0.18  # probability a killed enemy drops a powerup
+COMBO_WINDOW    = 2.5   # seconds to chain kills for score multiplier
+PULSE_RADIUS    = 120   # px shockwave radius around player
 
 
 class GameState(Enum):
@@ -602,6 +604,10 @@ class Player:
         self.invincible    = 0.0
         self.invincible_cd = 1.5
 
+        # Defensive pulse ability
+        self.pulse_cd      = 0.0
+        self.pulse_max_cd  = 8.0
+
         # Visual
         self.age          = 0.0
         self.hit_flash    = 0.0
@@ -665,6 +671,7 @@ class Player:
         self.shoot_cd   = max(0, self.shoot_cd - dt)
         self.invincible = max(0, self.invincible - dt)
         self.hit_flash  = max(0, self.hit_flash - dt)
+        self.pulse_cd    = max(0, self.pulse_cd - dt)
 
         # Power-up timers
         if self.triple_timer > 0:
@@ -681,6 +688,15 @@ class Player:
 
         # Emit engine thrust particles
         particles.emit_thrust(self.x, self.y + self.height)
+
+    def try_pulse(self, keys) -> bool:
+        """Trigger a radial defensive pulse (cooldown-gated)."""
+        if not keys[pygame.K_x]:
+            return False
+        if self.pulse_cd > 0:
+            return False
+        self.pulse_cd = self.pulse_max_cd
+        return True
 
     def take_damage(self, amount):
         if self.invincible > 0:
@@ -808,7 +824,7 @@ class UI:
             sl = self.font_tiny.render("SH", True, C_WHITE)
             surface.blit(sl, (x + BAR_W + 4, sy - 1))
 
-    def draw_score(self, surface, score, high_score, dt):
+    def draw_score(self, surface, score, high_score, dt, multiplier=1, combo_time=0.0):
         """Draw score and high score with pop animation."""
         self.score_pop = max(0, self.score_pop - dt * 4)
         scale = 1.0 + self.score_pop * 0.3
@@ -827,6 +843,19 @@ class UI:
             hs = self.font_tiny.render(f"HI {high_score:08d}", True, (160, 140, 100))
             surface.blit(hs, hs.get_rect(topright=(BASE_W - 8, 36)))
 
+        # Combo multiplier indicator
+        if multiplier > 1:
+            col = (255, 220, 90)
+            combo_txt = self.font_medium.render(f"x{multiplier} COMBO", True, col)
+            surface.blit(combo_txt, combo_txt.get_rect(topright=(BASE_W - 8, 56)))
+            if combo_time > 0:
+                ratio = clamp(combo_time / COMBO_WINDOW, 0, 1)
+                bar_w = 100
+                bx, by = BASE_W - 8 - bar_w, 80
+                pygame.draw.rect(surface, (35, 35, 35), (bx, by, bar_w, 7), border_radius=3)
+                pygame.draw.rect(surface, col, (bx, by, int(bar_w * ratio), 7), border_radius=3)
+                pygame.draw.rect(surface, C_WHITE, (bx, by, bar_w, 7), 1, border_radius=3)
+
     def draw_powerup_timers(self, surface, player: Player):
         """Show active power-up countdown bars."""
         x, y = 10, BASE_H - 60
@@ -843,6 +872,15 @@ class UI:
             lbl = self.font_tiny.render(label, True, col)
             surface.blit(lbl, (x + 84, y - 1))
             y -= 14
+
+        # Defensive pulse cooldown
+        ratio = 1.0 - (player.pulse_cd / player.pulse_max_cd if player.pulse_max_cd > 0 else 0)
+        ratio = clamp(ratio, 0, 1)
+        pygame.draw.rect(surface, (30, 30, 30), (x, y, 80, 8), border_radius=3)
+        pygame.draw.rect(surface, (80, 210, 255), (x, y, int(80 * ratio), 8), border_radius=3)
+        pygame.draw.rect(surface, C_WHITE, (x, y, 80, 8), 1, border_radius=3)
+        lbl = self.font_tiny.render("PULSE", True, (80, 210, 255))
+        surface.blit(lbl, (x + 84, y - 1))
 
     def draw_wave_info(self, surface, wave, enemy_count):
         """Small wave indicator top-left."""
@@ -872,6 +910,7 @@ class UI:
         controls = [
             ("MOVE",  "WASD / ARROW KEYS"),
             ("SHOOT", "SPACE"),
+            ("PULSE", "X (clears bullets)"),
         ]
         for i, (action, key) in enumerate(controls):
             draw_text_centered(surface, f"{action:<7} {key}",
@@ -1020,6 +1059,9 @@ class Game:
         self.spawner   = EnemySpawner()
         self.score     = 0
         self.new_record = False
+        self.combo_chain = 0
+        self.combo_timer = 0.0
+        self.multiplier  = 1
 
     # ── Main loop ─────────────────────────────────────────────
 
@@ -1076,10 +1118,18 @@ class Game:
 
         # Player
         self.player.handle_input(keys, dt)
+        self.combo_timer = max(0, self.combo_timer - dt)
+        if self.combo_timer <= 0 and self.multiplier > 1:
+            self._break_combo()
+
         new_bullets = self.player.try_shoot(keys, self.particles)
         if new_bullets:
             self.sound.play("shoot", 0.4)
         self.bullets.extend(new_bullets)
+
+        if self.player.try_pulse(keys):
+            self._trigger_pulse()
+
         self.player.update(dt, self.particles)
 
         # Enemy spawning
@@ -1136,7 +1186,10 @@ class Game:
             # Enemy bullets hit player
             else:
                 if b.rect.colliderect(player_rect):
+                    hp_before = self.player.hp + self.player.shield_hp
                     self.player.take_damage(b.damage)
+                    if self.player.hp + self.player.shield_hp < hp_before:
+                        self._break_combo()
                     b.alive = False
                     self.particles.emit_hit(b.x, b.y)
                     self.sound.play("hit", 0.5)
@@ -1144,7 +1197,10 @@ class Game:
         # Enemy body collision with player
         for e in self.enemies:
             if e.alive and e.rect.colliderect(player_rect):
+                hp_before = self.player.hp + self.player.shield_hp
                 self.player.take_damage(25)
+                if self.player.hp + self.player.shield_hp < hp_before:
+                    self._break_combo()
                 e.alive = False
                 self.particles.emit_explosion(e.x, e.y, e.color)
                 self.sound.play("explosion", 0.7)
@@ -1158,13 +1214,38 @@ class Game:
                 self.sound.play("powerup", 0.8)
 
     def _on_enemy_killed(self, enemy: Enemy):
-        self.score += enemy.score
+        self.combo_chain += 1
+        self.multiplier = min(5, 1 + self.combo_chain // 3)
+        self.combo_timer = COMBO_WINDOW
+        self.score += enemy.score * self.multiplier
         self.ui.pop_score()
         self.particles.emit_explosion(enemy.x, enemy.y, enemy.color, count=20)
         self.sound.play("explosion", 0.6)
         # Chance to drop power-up
         if random.random() < POWERUP_CHANCE:
             self.powerups.append(PowerUp(enemy.x, enemy.y))
+
+    def _break_combo(self):
+        self.combo_chain = 0
+        self.combo_timer = 0.0
+        self.multiplier = 1
+
+    def _trigger_pulse(self):
+        # Visual ring burst around the ship.
+        self.particles.emit_explosion(self.player.x, self.player.y, (80, 210, 255), count=28, speed_range=(80, 240))
+
+        # Clear nearby enemy bullets.
+        for b in self.bullets:
+            if b.alive and not b.is_player and distance(b.x, b.y, self.player.x, self.player.y) <= PULSE_RADIUS:
+                b.alive = False
+                self.particles.emit_hit(b.x, b.y)
+
+        # Damage nearby enemies.
+        for e in self.enemies:
+            if e.alive and distance(e.x, e.y, self.player.x, self.player.y) <= PULSE_RADIUS:
+                e.take_damage(35)
+                if not e.alive:
+                    self._on_enemy_killed(e)
 
     def _on_player_death(self):
         self.particles.emit_explosion(
@@ -1204,7 +1285,7 @@ class Game:
 
             # HUD
             self.ui.draw_health_bar(s, self.player)
-            self.ui.draw_score(s, self.score, self.high_score, 0)
+            self.ui.draw_score(s, self.score, self.high_score, 0, self.multiplier, self.combo_timer)
             self.ui.draw_powerup_timers(s, self.player)
             self.ui.draw_wave_info(s, self.spawner.wave, len(self.enemies))
 
